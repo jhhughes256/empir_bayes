@@ -1,0 +1,37 @@
+Once the empirical Bayesian estimation works with no issues, the focus can turn
+to the Bayesian Forecasting tab of the application. It will feature a plot
+showing individual predicted concentrations obtained from the Bayesian
+estimation, as well as forecasted concentrations if the same dosing schedule is
+maintained.
+
+The forecasting part of the application can be interacted with by the user. They
+will have access to a single row of input boxes, similar to the dose input from
+the first tab, which will determine what dosing strategy will be used for the
+forecasted section of the plot.
+
+This row of inputs uses the same function as that in the first tab, and is
+propogated with the latest doses defined by the user. The date and time are
+determined by finding the last dose given, and then determining the date and 
+time of the next dose provided that the frequency remains the same.
+
+This is then incorporated into a simulation dataset including the dosing history
+and concentration samples as described by the user, the future dosing plan and
+simulation times to provide adequate plot resolution.
+
+The final plot is planned to have a visual distinction between historic and
+forecasted predictions. A flag variable is made to determine if concentrations
+are beyond the future dosing plan to enable this. Additionally, observed samples
+are planned to appear on the plot as points. To ensure these data are in the
+final plot data `R.plot.data()` the `carry_out` function from `mrgsolve` is
+used. Observed values are changed from `DV` to `OBS` so that they do not clash
+with model output.
+
+For plotting, all theme options are defined in `global.R`. A colour palette can
+also be defined here if desired. The plot is built normally within the 
+`renderPlot({})` function, with corresponding `plotOutput()` in the `ui.R` file.
+
+Finally, the AUC can be displayed for the user. The user would most likely
+be interested in the AUC in the last 24 hours, and the AUC of the final
+forecasted dose. Times can be changed according to what the user's interests
+would be. These are rendered as Text, `renderText` in the server, and then 
+received using `uiOutput()` in the ui.

@@ -1,0 +1,931 @@
+---
+title: "Empirical Bayesian Estimation"
+author: "Jim Hughes"
+date: "4 September 2019"
+output:
+  html_document: default
+---
+
+## Aim
+
+This document aims to provide a workflow for empirical Bayesian estimation
+using the `PKADVAN` package in R. Each step covered is accompanied by an example 
+script. The steps covered by this manuscript are:
+
+* Simulation of "observed data" using `PKADVAN`
+* Utilising empirical Bayesian estimation to obtain individual pharmacokinetic
+parameters
+* Evaluation of empirical Bayes estimates
+
+```{r setup}
+# Load libraries
+  library(PKADVAN)
+  library(plyr)
+  library(data.table)
+  library(MASS)
+  library(ggplot2)
+```
+
+## Overview
+
+For a given set of observed pharmacokinetic data for which there is an existing
+population pharmacokinetic model, the individual pharmacokinetic parameters
+(clearance, CL; volume of distribution, Vd etc.) can be obtained using empirical
+Bayesian estimation. These individual parameters are also known as empirical
+Bayesian estimates (EBEs). 
+
+Software such as NONMEM provide EBEs as a part of 
+it's post-hoc analysis. While this is often considered the easiest way to get 
+EBEs, there are cases where the use of NONMEM is not practical, feasible or 
+optimal. Fortunately, EBEs can be obtained using R, by utilising packages such
+as `mrgsolve`, `RxODE`, `deSolve` and `PKADVAN`. 
+
+Bayesian forecasting is a method of extrapolating from observed data to predict
+future events. With pharmacokinetic data, this is done to predict patient
+exposure after given certain doses with the aim of optimising that dose to
+maximise efficacy and minimise toxicity. Bayesian forecasting uses EBEs to make
+it's predictions.
+
+### R Packages
+
+The three differential equation solver packages `mrgsolve`, `RxODE` and 
+`deSolve` allow the user to define any model, while `PKADVAN` is limited to the 
+pre-defined model types within the package due to it's use of analytical 
+solutions. The requirement of an R tools installation for `mrgsolve` and `RxODE` 
+may cause difficulties on some systems, making `deSolve` and `PKADVAN` easier to
+use with little setup required. While `mrgsolve`, `RxODE` and `PKADVAN` work 
+using similar datasets and workflows to those seen in NONMEM, while `deSolve`
+is structured somewhat differently making its use less intuitive for NONMEM
+users.
+
+In this document R version 3.4.4 was used with the following packages:
+
+* `PKADVAN` ver. 0.1.0
+* `plyr` ver. 1.8.4
+* `data.table` ver. 1.12.2
+* `MASS` ver. 7.3.51.4
+* `ggplot2` ver. 3.1.1
+
+## Observed Data
+
+The observed data used to obtain EBEs will need to be in a long-format (also
+known as NONMEM-format), as typically used in NONMEM. This data format describes
+in each row, data that describes the dose and concentrations at each time. The
+`prepare_data_workflow` series of documents (.R, .Rmd, .html) give detailed 
+examples of how to prepare long-format data.
+
+For this document, an example dataset will be simulated. It should be noted that
+the process describing simulation is not necessary if observed data is 
+available. However, it may help readers to understand how `PKADVAN` simulation 
+works, as it is a crucial part of empirical Bayesian estimation. Additionally,
+users will be required to make model-specific simulation code whenever 
+performing empirical Bayesian estimation.
+
+Simulating observed data requires:
+
+* a population pharmacokinetic model
+* a description of the population of interest
+* a drug regimen describing dose and concentration times
+
+These three components are defined in `pkadvan_simulation.R`.
+
+### Population Pharmacokinetic Model
+
+Population pharmacokinetic models used with `PKADVAN` must match one of the 
+pre-defined model types in its library of models. These 26 models include:
+
+* Basic Pharmacokinetic models
+    + 1, 2 or 3 compartments
+    + IV bolus, IV infusion or oral administration
+* Transit First-Order Absorption Models
+    + 1 or 2 compartments
+    + 1, 2, 3 or 4 transits
+* First-Order Formation Metabolite Models
+    + 1, 2 or 3 compartments for parent, 1 compartment for metabolite
+    + IV bolus, IV infusion or oral administration
+    
+Models that do not fit under these model types cannot be simulated by `PKADVAN`.
+`PKADVAN` works with time-varying covariates, but only updates the value of the
+covariate for each value provided by the original data. Care should be taken 
+simulating sparse regimens when models incorporate time-varying covariates.
+
+In this document we pharmacokinetic model of interest is for vemurafenib. It is
+published in the Clinical Pharmacology and Biopharmaceutics Review for 
+Vemurafenib (Application Number: 202429Orig1s000) submitted to the FDA. The 
+original model can be found on page 50, with an FDA-revised model on page 60.
+
+The FDA revised model is presented below. The use of the `list()` function is
+not mandatory, but is used here to keep all information required for the use of
+the model in one R object. 
+
+```{r pkmod}
+# Define pharmacokinetic model
+# The pharmacokinetics of vemurafenib are explained by a one-compartment model
+#   with first order absorption & first order elimination.
+# Model was built using BRIM2, BRIM3 and an unavailable Phase I dataset
+# PKADVAN function for this is: PKADVAN::OneCompFirstOrderAbs
+# Requires parameters for F1, KA, CL & V (found using ?PKADVAN::OneCompFirstOrderAbs)
+# Order and naming doesn't matter *here*, just a way of keeping our model 
+#   parameters tidy and not scattered into the global environment.
+  pk_mod <- list(
+  # Population Parameters
+    POPCL = 1.3,  # apparent clearance; L/h
+    POPV = 106,  # apparent volume; L
+    POPKA = 0.188,  # absorption constant; h-1
+    POPF1 = 1,  # relative bioavailability, DAY >= 105
+  # Covariate Effects
+    REFWT = 70,
+    WTonCL = 0.319,
+    WTonV = 0.740,
+    Tlt14onF1 = 0.789,  # relative bioavailability, DAY <= 14  # only on BRIM2
+    Tlt104onF1 = 0.899,  # relative bioavailability, DAY > 15 & DAY <= 104  # only on BRIM2
+  # Population Parameter Variability
+    PPVCL = 0.319,  # apparent clearance variability; CV (coefficient of variation)
+    PPVV = 0.657,  # apparent volume variability; CV
+    PPVKA = 1.01,  # absorption constant variability; CV
+  # Residual Unexplained Variability
+    RUVADD = 0.814,  # additive error; mg/L
+    RUVPRO = 0.228  # proportional error; CV
+  )
+```
+
+### Population of Interest
+
+Given that the population pharmacokinetic model includes weight this must be
+specified for each patient, when defining the population of interest. If using 
+observed data, then these are the demographic data that need to be extracted 
+the available subject-level data.
+
+When simulating pharmacokinetic data, covariate data can be sampled from a 
+random distribution. The mean and standard deviation of the covariate, as well 
+as the shape of the distribution (normal vs. log-normal) should be considered.
+In this example a normal distribution is assumed for simplicity, with a mean 
+weight of 70 kg and standard deviation of 5 kg.
+
+Additionally, as we are simulating pharmacokinetic data in this example, a
+description of the population parameter variability for each patient `ETA` is 
+sampled from a normal distribution with a mean of zero and standard deviation 
+equal to the square root of the variance associated with each population 
+parameter `PPV`. 
+
+```{r pop1}
+# Create subject level data
+# Define subject numbers
+  nid <- 60
+  ID <- 1:nid
+  
+# Sample Individual Population Parameters
+  pop_tbl <- data.table(
+    STUDYID = rep(c("BRIM2", "BRIM3", "coBRIM"), each = 20),
+    SUBJID = ID,
+    ETA1 = rnorm(nid, 0, sd = sqrt(pk_mod$PPVCL)),
+    ETA2 = rnorm(nid, 0, sd = sqrt(pk_mod$PPVV)),
+    ETA3 = rnorm(nid, 0, sd = sqrt(pk_mod$PPVKA)),
+    WT = rnorm(nid, 70, sd = 5)
+  )
+```
+
+### Drug Regimen
+
+The drug regimen defines when doses are given to patients, in addition to times
+at which concentration predictions are desired (or are available with observed
+data). For observed data, this is obtained through the preparation of the data
+in a long-format. When simulating data, these must be defined. 
+
+The regimen outlined below follows the protocol for dosing and plasma-samples 
+of the BRIM2, BRIM3 and coBRIM vemurafenib clinical trials. Each trial
+is assigned 20 patients.
+
+```{r reg1}
+# Create longitudinal data
+# Dose data
+  dose_times <- seq(0, 1020, by = 12)
+  dose_tbl <- data.table(
+    SUBJID = rep(ID, each = length(dose_times)),
+    TIME = dose_times,
+    AMT = 960,
+    MDV = 1,
+    DV = 0
+  )
+    
+# Concentration data
+  conc_times_brim2 <- as.numeric(outer(c(-0.25, 2, 4, 6, 8), c(0, 360, 504, 1008), FUN = "+"))
+  conc_brim2 <- data.table(
+    SUBJID = rep(ID[1:20], each = length(conc_times_brim2)),
+    TIME = rep(conc_times_brim2, nid/3),
+    AMT = 0,
+    MDV = 0,
+    DV = 0
+  )
+  conc_times_brim3 <- as.numeric(outer(c(-0.25, 2.5), c(0, 360, 504), FUN = "+"))
+  conc_brim3 <- data.table(
+    SUBJID = rep(ID[21:40], each = length(conc_times_brim3)),
+    TIME = rep(conc_times_brim3, nid/3),
+    AMT = 0,
+    MDV = 0,
+    DV = 0
+  )
+  conc_times_cobrim <- as.numeric(outer(c(-0.25, 3), c(0, 360, 672), FUN = "+"))
+  conc_cobrim <- data.table(
+    SUBJID = rep(ID[41:60], each = length(conc_times_cobrim)),
+    TIME = rep(conc_times_cobrim, nid/3),
+    AMT = 0,
+    MDV = 0,
+    DV = 0
+  )
+  conc_tbl <- rbind(conc_brim2, conc_brim3, conc_cobrim)
+  conc_tbl <- conc_tbl[TIME >= 0, ]
+  
+# Merge final dataset
+  pk_tbl <- rbind(dose_tbl, conc_tbl)
+  input_tbl <- merge(pop_tbl, pk_tbl, by = "SUBJID")
+  setorder(input_tbl, SUBJID, TIME)
+```
+
+Using this drug regimen, along with the population data and pharmacokinetic
+model, the example pharmacokinetic data for this document is simulated below.
+
+The following code showcases how `PKADVAN` is utilised. `PKADVAN` is only able
+to simulate the pharmacokinetic data of one patient at a time. Therefore, a
+function is defined to handle individual simulation of data `pkadvan_sim_fn`,
+which is then fed to a `ddply()` function to run the function on each subjects
+input data `input_tbl`, identifying each subject using the `SUBJID` column.
+
+The `pkadvan_sim_fn` does the following:
+
+* Converts the input data.frame containing a single individuals data into the
+data.table format
+* Determines the individual parameter values for the patient based on their
+`ETA` values and their demographic data
+    + The parameter values required is dependent on the `PKADVAN` model type 
+    used
+        - In this example `OneCompFirstOrderAbs()` describes the vemurafenib 
+        model
+        - The required parameter values are found by entering 
+        `??OneCompFirstOrderAbs` 
+        - This shows that input data must contain the following columns: `ID, `
+        `TIME, AMT, F1, KA, CL, V`. `F1`, `KA`, `CL` and `V` are the parameter
+        values.
+    + The individual parameter values are calculated by multiplying the 
+    population parameter value with any covariate effects or population 
+    parameter variability defined in the model. e.g. `POPX * COVX * exp(ETAX)`
+        - F1 only has a covariate effect if the patient is in the BRIM2 study, 
+        which varies dependent on whether the patient has been on the medication 
+        for longer than 14 days.
+        - CL and V have a covariate effect (weight) `(WT/REFWT)^WTonCL` and 
+        population parameter variability `exp(ETA1)`.
+        - KA only has population parameter variability `exp(ETA3)`.
+* The `OneCompFirstOrderAbs()` function is given these values as input and
+simulates the individual predictions for plasma sample concentration values.
+* Then the residual unexplained variability is added to the individual
+predictions to provide the observed data/dependent variable `DV`.
+    + In this example the residual unexplained variability is defined using
+    a weight term `W = sqrt( (IPRED*RUVPRO)^2) + RUVADD^2 )`.
+    + This term describes a combined error model, made up of a proportional
+    component `(IPRED*RUVPRO)^2)` and an additive component `RUVADD^2`.
+    + The weight term is then multiplied by a randomly sampled value from
+    a normal distribution with a mean of zero and standard deviation of 1 
+    and added to the individual predicted concentration.
+* Finally the data is cleaned up and the desired columns are returned as output
+from the function
+    + Any observed data `DV` simulated below zero is corrected to zero and
+    marked as missing using the `MDV` column. This is to match what would be
+    seen in long-format observed data.
+    + In this example only `"STUDYID", "SUBJID", "TIME"...`, when used with 
+    empirical Bayesian estimation individual parameter values are also returned.
+
+```{r sim1}
+# Define simulation function
+  pkadvan_sim_fn <- function(input_df) {
+  # Define parameter values
+    ipred_in <- as.data.table(input_df)
+  # Bioavailability - time-varying covariate
+    ipred_in[, DAY := TIME/24 + 1]
+    ipred_in[, F1 := with(pk_mod, POPF1)]
+    ipred_in[DAY <= 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt14onF1)]
+    ipred_in[DAY > 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt104onF1)]
+  # Clearance and volume - covariate and population parameter variability
+    ipred_in[, CL := with(pk_mod, POPCL * (WT/REFWT)^WTonCL * exp(ETA1) )]
+    ipred_in[, V := with(pk_mod, POPV * (WT/REFWT)^WTonV * exp(ETA2) )]
+  # Absorption constant - population parameter variability
+    ipred_in[, KA := with(pk_mod, POPKA * exp(ETA3) )]
+  # Predict individual concentrations using PKADVAN
+    ipred_out <- PKADVAN::OneCompFirstOrderAbs(ipred_in)
+  # Sample residual unexplained variability
+    ipred_out[, W := with(pk_mod, sqrt((IPRED*RUVPRO)^2) + RUVADD^2)]
+    ipred_out[, DV := IPRED + W*rnorm(length(IPRED), 0, 1)]
+  # Clean up and return data
+    ipred_out[DV <= 0, DV := 0]
+    ipred_out[DV <= 0, MDV := 1]
+    ipred_out[, c("STUDYID", "SUBJID", "TIME", "AMT", "MDV", "DV", "WT", "DAY")]
+  }
+# Run simulation function
+  pkdata <- as.data.table(ddply(input_tbl, .(SUBJID), pkadvan_sim_fn))
+```
+
+Using this dataset, Bayesian estimation be demonstrated. Here is an example of 
+the simulation output.
+
+```{r sim2, echo = F}
+  head(pkdata, 6)
+```
+
+```{r sim3, echo = FALSE, fig.width = 11.8, fig.height = 11.8}
+# Set ggplot2 theme
+  theme_bw2 <- theme_set(theme_bw(base_size = 14))
+  theme_update(plot.title = element_text(hjust = 0.5))
+  
+  CI90lo <- function(x) quantile(x, probs = 0.05)
+  CI90hi <- function(x) quantile(x, probs = 0.95)
+  
+# Create plot data
+  plotdata <- pkdata
+  plotdata[, TIMEDY := TIME/24]
+
+# Plot individual patient vancomycin concentrations
+  p <- NULL
+  p <- ggplot(data = plotdata)
+  p <- p + geom_point(aes(x = TIMEDY, y = DV), colour = "blue", shape = 1, 
+    size = 1.5, alpha = 0.5)
+  p <- p + stat_summary(aes(x = TIMEDY, y = DV), geom = "line", fun.y = median,
+    colour = "red", size = 1)
+  p <- p + stat_summary(aes(x = TIMEDY, y = DV), geom = "ribbon",
+    fun.ymin = CI90lo,  fun.ymax = CI90hi, fill = "red", size = 1, alpha = 0.25)
+  p <- p + labs(x = "Time (days)", y = "Vemurafenib Concentration (mg/L)")
+  p <- p + coord_cartesian(xlim = c(0, 40), ylim = c(0, 200))
+  p <- p + facet_wrap(~STUDYID)
+  p
+```
+
+In this image the blue dots represent individual plasma concentrations, while
+the red line and ribbon represent the median along with the upper and lower
+90% confidence intervals of the concentration over time.
+
+Now that an example dataset has been created and a basic understanding of
+`PKADVAN` is obtained, empirical Bayesian estimation can begin.
+
+## Empirical Bayesian Estimation
+
+Empirical Bayesian estimation (also known as _maximum a priori_ estimation),
+determines individual pharmacokinetic parameters by minimising a maximum 
+likelihood objective function. Sample blood concentrations along with dose
+and covariate information is used (from observed or simulated data) along with
+a population pharmacokinetic model for estimation. 
+
+Estimation is undertaken by an optimisation algorithm (R base function `optim`).
+This minimises an objective function value as defined below. This provides 
+estimates that maximise the two following properties:
+
+* the likelihood that the difference between the observed concentration data 
+and the individual concentration predictions is described by the residual
+unexplained variability distribution of the model (posterior likelihood)
+* the likelihood that parameter estimates are sampled from the population
+parameter variability distribution as described by the model (prior likelihood)
+
+$$
+OFV = -ln \left( \sum_{i=1}^n \frac{
+    e^{ -\frac{
+      ( C_i - \hat{C}_i )^2
+    }{
+      2( \hat{C}_i \sigma )^2
+    }}
+  }{
+    \sqrt{2\pi ( \hat{C}_i \sigma )^2}
+  } + \sum_{k=1}^s \frac{
+    e^{ -\frac{ \eta_k^2 }{ 2 \omega_k^2 }}
+  }{
+    \sqrt{2 \pi \omega_k^2}
+  } \right)
+$$
+
+_where $OFV$ is the maximum likelihood objective function to be minimised, $n$
+is the number of plasma sample concentrations, $C_i$, with $i = 1$ for
+the first sample and $i = n$ for the last available sample, $\hat{C}_i$
+are the Bayesian predictions for each plasma sample concentration and $\sigma$ 
+is the vemurafenib pharmacokinetic model standard deviation for the residual 
+unexplained variability of measured concentrations. $s$ is the number of 
+pharmacokinetic parameters to be estimated with $k = 1$ for the first parameter 
+and $k = s$ for the final parameter, $\eta_k$ is the Bayesian predictions for 
+the random effect which reflects the difference between the individual's $k$th 
+parameter value and the population value, and $\omega_k$ is the vemurafenib 
+pharmacokineitc model standard deviation term for the inter-individual 
+variability for the $k$th parameter._
+
+### Single Patient Estimation
+
+As an example, the EBEs for a single patient are estimated in this section. The
+data available for this single patient is shown below.
+
+```{r ebe0}
+  singletbl <- pkdata[SUBJID == 1, ]
+  names(singletbl)[2] <- "ID"
+  singletbl[MDV == 0, ]
+```
+
+The two key parts of any optimisation algorithm are the initial parameters and
+the function that provides a value to be minimised. When creating an 
+optimisation algorithm it can be useful to use data from a single patient and 
+an example of the parameters that will be provided to the function to ensure it 
+is working properly. 
+
+Below the line `bayes_estimate_fn <- function(par)` as well as it's opening and 
+closing brackets are commented out, while the debug lines starting with
+`par <- c(0.995, 0.996, 1.007)` is uncommented to show how the function works.
+
+First the predicted concentration that corresponds with the provided ETA values
+is determined. Notice that the simulation of individual predictions is the same
+as shown above. The main differences are that the values for `par` are used
+to define the `ETA` values for each population parameter. Additionally, any 
+values that aren't finite, or are below a threshold are set to that threshold.
+This is to avoid negative or zero concentrations.
+
+```{r ebe1}
+# Define bayesian estimation function
+  # bayes_estimate_fn <- function(par) {
+  # Debug:
+    par <- c(1.007, 0.996, 1.003)
+  # Describe parameters to be optimised and dataset to be used
+    ETA <- log(par)
+    pk_in <- singletbl
+  # Define PKADVAN input dataset
+  # Relative bioavailability - time-varying covariate
+    pk_in[DAY <= 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt14onF1)]
+    pk_in[DAY > 14 & DAY <= 104 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt104onF1)]
+    pk_in[(DAY >= 105 & STUDYID == "BRIM2") | STUDYID != "BRIM2", F1 := with(pk_mod, POPF1)]
+  # Clearance and volume - covariate and population parameter variability
+    pk_in[, CL := with(pk_mod, POPCL * (WT/REFWT)^WTonCL * exp(ETA[1]) )]
+    pk_in[, V := with(pk_mod, POPV * (WT/REFWT)^WTonV * exp(ETA[2]) )]
+  # Absorption constant - population parameter variability
+    pk_in[, KA := with(pk_mod, POPKA * exp(ETA[3]) )]
+  # Calculate concentrations using PKADVAN
+    pk_out <- PKADVAN::OneCompFirstOrderAbs(pk_in)
+  # Ensure DV has finite values
+    pk_out[!is.finite(IPRED) | IPRED < .Machine$double.eps, IPRED := .Machine$double.eps]
+  # Define DV (y) and individual prediction for DV (yhat)
+    y <- pk_out[MDV == 0, DV]
+    yhat <- pk_out[MDV == 0, IPRED]
+```
+
+Now the  predicted concentrations that correspond with the provided ETA
+values has been determined, the objective function value can be determined. As
+shown above this has two parts. The first part, the posterior, requires:
+
+* observed concentration data
+* predicted concentration data (no RUV)
+* standard deviation for each observation
+
+The standard deviation is determined from the description of RUV from the popPK
+model. The value given for standard deviation is equivalent to what would be
+defined as the weight or `W` in some styles of NONMEM model definition. How this 
+value is determined depends on the RUV model type:
+
+* If the model has additive error, then this value will be the same for 
+each value as the error does not change between observations
+    + NONMEM: `DV = IPRED + ERR_ADD*EPS(1)`
+    + NONMEM: `W = ERR_ADD;  DV = IPRE + W*EPS(1)`
+    + R: `loglikpost_sd <- mod$ERR_ADD`
+* If the model has proportional error, then this value will be dependent on the
+value of `yhat`
+    + NONMEM: `DV = IPRED*(1 + ERR_PRO*EPS(1))`
+    + NONMEM: `W = IPRED*ERR_PRO;  DV = IPRE + W*EPS(1)`
+    + R: `loglikpost_sd <- yhat*mod$ERR_PRO`
+* If the model has additive and proportional error, then this value will be 
+dependent on the value of `yhat` but also needs to incorporate the additve error
+    + NONMEM: `IPRED*(1 + ERR_PRO*EPS(1)) + ERR_ADD*EPS(2)`
+    + NONMEM: `W = SQRT((IPRED*ERR_PRO)**2 + ERR_ADD**2);  DV = IPRE + W*EPS(1)`
+    + R: `loglikpost_sd <- sqrt((yhat*mod$ERR_PRO)^2 + mod$ERR_ADD^2)`
+    
+The vemurafenib model has additive and proportional error, so the weight is 
+calculated accordingly. 
+
+In this case the log-likelihood function `dnorm(..., log = T)` determines the 
+likelihood (given as a log value) that the observed data `y` was sampled 
+from a normal distribution with a mean equal to the predicted concentration
+`yhat` and standard deviation equal to the weight for that prediction given by
+the model `loglikpost_sd`.
+
+```{r ebe2}
+  # Determine posterior and prior log-likelihood
+  # Posterior log-likelihood
+  # Error model: IPRED*(1+ + RUVPRO*EPS(1)) + RUVADD*(EPS(2))
+  # Can be simplified to: IPRED + W*EPS(1)
+  # where W = sqrt((IPRED*RUVPRO)^2 + RUVADD^2)
+    loglikpost_sd <- with(pk_mod, sqrt((yhat*RUVPRO)^2 + RUVADD^2))
+    loglikpost <- dnorm(y, mean = yhat, sd = loglikpost_sd, log = T)
+    loglikpost
+```
+
+The second part of the objective function value is the prior log-likelihood.
+In this case the log-likelihood function determines the likelihood (given as a 
+log value) that the given estimate of ETA `log(par)` was sampled from a normal 
+distribution with a mean equal to zero and standard deviation equal to the 
+square root of the population parameter variability as defined by the model
+`ETAPPV`.
+
+The sum of the two parts are found, and the negative of the value is found. This
+is because we want to maximise the likelihood, but the optimisation algorithm
+is designed to minimise a value. By making the objective function value the 
+inverse of the likelihood, we minimise the objective function value while 
+maximising the likelihood.
+
+```{r ebe3}
+  # Prior log-likelihood
+    ETAPPV <- with(pk_mod, c(PPVCL, PPVV, PPVKA))
+    loglikprior <- dnorm(ETA, mean = 0, sd = ETAPPV, log = T)
+    loglikprior
+  # Return objective function value to be minimised
+    -1*sum(loglikpost, loglikprior)
+  # }
+```
+
+It should be noted that there are 19 values for the posterior likelihood, but 
+only 3 values for the prior likelihood. This is an inherent property of EBEs.
+When data is sparse, the estimates prioritise maximising the prior likelihood.
+As more data is available, the priority shifts more to the posterior likelihood.
+
+These processes make up the function that will be used with the optimisation
+algorithm function `optim()`.
+
+```{r ebe4}
+# Define bayesian estimation function
+  bayes_estimate_fn <- function(par) {
+  # Describe parameters to be optimised and dataset to be used
+    ETA <- log(par)
+    pk_in <- singletbl
+  # Define PKADVAN input dataset
+  # Relative bioavailability - time-varying covariate
+    pk_in[DAY <= 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt14onF1)]
+    pk_in[DAY > 14 & DAY <= 104 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt104onF1)]
+    pk_in[(DAY >= 105 & STUDYID == "BRIM2") | STUDYID != "BRIM2", F1 := with(pk_mod, POPF1)]
+  # Clearance and volume - covariate and population parameter variability
+    pk_in[, CL := with(pk_mod, POPCL * (WT/REFWT)^WTonCL * exp(ETA[1]) )]
+    pk_in[, V := with(pk_mod, POPV * (WT/REFWT)^WTonV * exp(ETA[2]) )]
+  # Absorption constant - population parameter variability
+    pk_in[, KA := with(pk_mod, POPKA * exp(ETA[3]) )]
+  # Calculate concentrations using PKADVAN
+    pk_out <- PKADVAN::OneCompFirstOrderAbs(pk_in)
+  # Ensure DV has finite values
+    pk_out[!is.finite(IPRED) | IPRED < .Machine$double.eps, IPRED := .Machine$double.eps]
+  # Define DV (y) and individual prediction for DV (yhat)
+    y <- pk_out[MDV == 0, DV]
+    yhat <- pk_out[MDV == 0, IPRED]
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+  # Determine posterior and prior log-likelihood
+  # Posterior log-likelihood
+  # Error model: IPRED*(1+ + RUVPRO*EPS(1)) + RUVADD*(EPS(2))
+  # Can be simplified to: IPRED + W*EPS(1)
+  # where W = sqrt((IPRED*RUVPRO)^2 + RUVADD^2)
+    loglikpost_sd <- with(pk_mod, sqrt((yhat*RUVPRO)^2 + RUVADD^2))
+    loglikpost <- dnorm(y, mean = yhat, sd = loglikpost_sd, log = T)
+  # Prior log-likelihood
+    loglikprior <- dnorm(ETA, mean = 0, sd = ETAPPV, log = T)
+  # Return objective function value to be minimised
+    return(-1*sum(loglikpost, loglikprior))
+  }
+```
+
+When using the `optim` function, the following arguments are used:
+
+* `par` - initial parameters to be optimised: `init_par`
+* `fn` - function to be minimised: `bayes_estimate_fn`
+* `method` - function that minimises `fn`: `"L-BFGS-B"`
+    + there are a large number of methods available, L-BFGS-B is used here as it
+      is well suited to the given problem, and allows the use of upper and lower
+      boundaries for parameters
+* `lower` & `upper` - bounds on parameter values: `0.001 - 1000`
+    + must provide `lower` and `upper` bounds for each parameter value, in this
+      case we use the same bound for each parameter
+* `control` - a list of control parameters
+    + `parscale` & `fnscale` - scaling for parameter or function values 
+      `par/parscale` `fn(par)/fnscale`, the initial values are used so that the
+      relative parameter and relative objective function value is calculated
+    + `factr` & `pgtol` - change the tolerance for convergence
+
+```{r ebe5}
+# Define initial parameters
+  ETAPPV <- with(pk_mod, c(PPVCL, PPVV, PPVKA))  # CV is the desired format
+  n_eta <- length(ETAPPV)
+  init_par <- exp(double(n_eta))
+# Run bayes_estimate_fn using optim()
+  bayes_estimate <- try(optim(init_par, bayes_estimate_fn, method = "L-BFGS-B",
+    lower = rep(0.001, times = n_eta), upper = rep(1000, times = n_eta),
+    control = list(
+      parscale = init_par, fnscale = abs(bayes_estimate_fn(init_par)),
+      factr = 1e12, pgtol = 1e-8
+    )
+  ))
+  bayes_estimate
+```
+
+The output shows:
+
+* `$par` - the final parameter estimates
+* `$value` - the final value of the objective function value
+* `$counts` - number of times the function and gradient function were computed
+* `$convergence` - convergence status (0 is successful)
+* `$message` - character string providing additional info from the optimiser
+
+When using the `"L-BFGS-B" method the convergence message that you want is
+`"CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"`. Any other message can mean
+that something was not quite right with that optimisation.
+
+### Multiple Patient Estimation
+
+The advantage of using a programming language like R is that we can run the same
+process for multiple different cases, without writing the same thing for each
+specific patient. When applying a general function to multiple different 
+patients it is important to ensure that the function works correctly for all
+patients. Rather than specifically going through each patient, it can be 
+beneficial to set up the function in a way that checks it for you.
+
+This section will go through a Bayes function that is run on multiple patients.
+It should be noted that the additional components have been added to the 
+process to be run for each patient. 
+
+* Section 1: Prepare function environment
+* Section 2: Same as single patient, but:
+    + now wrapped in a repeat function, designed to repeat the process with
+      different initial parameters if optimisation is unsuccessful
+    + success of optimisation is determined by whether the `optim` output 
+      `$message` shows that convergence was successful
+    + now runs `optim` inside a `try` function, therefore if there is an error
+      which would cause R to completely stop and lose all output, instead a new
+      set of initial parameters can be trialled, could also be used for debug
+      purposes
+    + counts the number of repeated runs `run_num`, so that initial parameters
+      are changed, could also be used for debug purposes
+* Section 3: Simulate concentrations using optimised EBEs
+    + also simulates population predicted concentrations for EBE evaluation
+
+```{r ebe6}
+  # Define empirical bayesian estimation process function
+  ebe_fn <- function(input) {
+  # Prepare environment
+  # Convert input to data.table format
+    input <- as.data.table(input)[TIME >= 0, ]
+  # Define PPV vector and inital values for ETAs
+    ETAPPV <- with(pk_mod, c(PPVCL, PPVV, PPVKA))  # CV is the desired format
+    n_eta <- length(ETAPPV)
+    init_par <- exp(double(n_eta))
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Set up loop to repeat bayesian estimation until predictions for individual
+  #   parameters minimise successfully.
+    run_num <- 0
+    repeat {
+    # If there has been any previous unsuccessful runs, sample initial ETAs
+    #   from random uniform distribution
+      if (run_num > 0) {
+        init_par <- init_par*exp(runif(n_eta, min = -0.01, max = 0.01))
+      }
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    # Define bayesian estimation function
+      bayes_estimate_fn <- function(par) {
+      # Describe parameters to be optimised and dataset to be used
+        ETA <- log(par)
+        pk_in <- input
+      # Define PKADVAN input dataset
+      # Relative bioavailability - time-varying covariate
+        pk_in[DAY <= 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt14onF1)]
+        pk_in[DAY > 14 & DAY <= 104 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt104onF1)]
+        pk_in[(DAY >= 105 & STUDYID == "BRIM2") | STUDYID != "BRIM2", F1 := with(pk_mod, POPF1)]
+      # Clearance and volume - covariate and population parameter variability
+        pk_in[, CL := with(pk_mod, POPCL * (WT/REFWT)^WTonCL * exp(ETA[1]) )]
+        pk_in[, V := with(pk_mod, POPV * (WT/REFWT)^WTonV * exp(ETA[2]) )]
+      # Absorption constant - population parameter variability
+        pk_in[, KA := with(pk_mod, POPKA * exp(ETA[3]) )]
+      # Calculate concentrations using PKADVAN
+        pk_out <- PKADVAN::OneCompFirstOrderAbs(pk_in)
+      # Ensure DV has finite values
+        pk_out[!is.finite(IPRED) | IPRED < .Machine$double.eps, IPRED := .Machine$double.eps]
+      # Define DV (y) and individual prediction for DV (yhat)
+        y <- pk_out[MDV == 0, DV]
+        yhat <- pk_out[MDV == 0, IPRED]
+      # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+      # Determine posterior and prior log-likelihood
+      # Posterior log-likelihood
+      # Error model: IPRED*(1+ + RUVPRO*EPS(1)) + RUVADD*(EPS(2))
+      # Can be simplified to: IPRED + W*EPS(1)
+      # where W = sqrt((IPRED*RUVPRO)^2 + RUVADD^2)
+        loglikpost_sd <- with(pk_mod, sqrt((yhat*RUVPRO)^2 + RUVADD^2))
+        loglikpost <- dnorm(y, mean = yhat, sd = loglikpost_sd, log = T)
+      # Prior log-likelihood
+        loglikprior <- dnorm(ETA, mean = 0, sd = ETAPPV, log = T)
+      # Return objective function value to be minimised
+        return(-1*sum(loglikpost, loglikprior))
+      }
+    # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+    # Use optim to optimise the objective function returned by bayes_estimate_fn
+      bayes_estimate <- try(optim(init_par, bayes_estimate_fn, method = "L-BFGS-B",
+        lower = rep(0.001, times = n_eta), upper = rep(1000, times = n_eta),
+        control = list(
+          parscale = init_par, fnscale = abs(bayes_estimate_fn(init_par)),
+          factr = 1e12, pgtol = 1e-8
+        )
+      ))
+    # Check to see if the minimisation was successful, if not repeat
+      minimised <- "CONVERGENCE: REL_REDUCTION_OF_F <= FACTR*EPSMCH"
+      if (class(bayes_estimate) != "try-error") {  # error catching
+        if (bayes_estimate$message == minimised) break  # exits repeat
+      }  # end if statement for error catching
+      run_num <- run_num + 1
+      if (run_num > 10) browser()  # multiple unsuccessful runs, then stop
+    }  # end repeat
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Use empirical bayes estimates to give desired output
+  # While we mainly want the empirical bayes estimates for clearance, we will
+  #   also collect IPRED and PRED to assess the model's ability to model data
+  #   from coBRIM which wasn't used for model development.
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Individual Predicted
+    pkadvan_ipred <- input
+  # Extract final ETA values from our minimised bayesian estimation step
+    ETA <- log(bayes_estimate$par)
+    ETA_tbl <- as.data.table(matrix(rep(ETA, dim(input)[1]), ncol = n_eta, byrow = TRUE))
+    names(ETA_tbl) <- paste0("ETA", readr::parse_number(names(ETA_tbl)))
+  # Define PKADVAN input dataset
+  # Relative bioavailability - time-varying covariate
+    pkadvan_ipred[DAY <= 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt14onF1)]
+    pkadvan_ipred[DAY > 14 & DAY <= 104 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt104onF1)]
+    pkadvan_ipred[(DAY >= 105 & STUDYID == "BRIM2") | STUDYID != "BRIM2", F1 := with(pk_mod, POPF1)]
+  # Clearance and volume - covariate and population parameter variability
+    pkadvan_ipred[, CL := with(pk_mod, POPCL * (WT/REFWT)^WTonCL * exp(ETA[1]) )]
+    pkadvan_ipred[, V := with(pk_mod, POPV * (WT/REFWT)^WTonV * exp(ETA[2]) )]
+  # Absorption constant - population parameter variability
+    pkadvan_ipred[, KA := with(pk_mod, POPKA * exp(ETA[3]) )]
+  # Predict individual concentrations using PKADVAN
+    ipred_out <- PKADVAN::OneCompFirstOrderAbs(pkadvan_ipred)
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Population Predicted
+  # We change the ETA's to zero (i.e. log(1)) and leave the rest of the model
+  #   the same.
+    pkadvan_pred <- input
+  # Extract final ETA values from our minimised bayesian estimation step
+    ETA <- log(rep(1, n_eta))  # shrink ETA to zero
+  # Define PKADVAN input dataset (same code)
+  # Relative bioavailability - time-varying covariate
+    pkadvan_pred[DAY <= 14 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt14onF1)]
+    pkadvan_pred[DAY > 14 & DAY <= 104 & STUDYID == "BRIM2", F1 := with(pk_mod, POPF1*Tlt104onF1)]
+    pkadvan_pred[(DAY >= 105 & STUDYID == "BRIM2") | STUDYID != "BRIM2", F1 := with(pk_mod, POPF1)]
+  # Clearance and volume - covariate and population parameter variability
+    pkadvan_pred[, CL := with(pk_mod, POPCL * (WT/REFWT)^WTonCL * exp(ETA[1]) )]
+    pkadvan_pred[, V := with(pk_mod, POPV * (WT/REFWT)^WTonV * exp(ETA[2]) )]
+  # Absorption constant - population parameter variability
+    pkadvan_pred[, KA := with(pk_mod, POPKA * exp(ETA[3]) )]
+  # Predict individual concentrations using PKADVAN
+    pred_out <- PKADVAN::OneCompFirstOrderAbs(pkadvan_pred)
+  # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+  # Return desired output
+    output <- cbind(ipred_out, ETA_tbl)
+    output$PRED <- pred_out$IPRED  # pred_out$IPRED is actually PRED
+  # Bind in true values for ETAs  
+  # Calculate weighted residuals and individual weighted residuals
+    output[, WRES := (DV-PRED)/with(pk_mod, sqrt((PRED*RUVPRO)^2 + RUVADD^2))]
+    output[, IWRES := (DV-PRED)/with(pk_mod, sqrt((IPRED*RUVPRO)^2 + RUVADD^2))]
+  # Return output
+    return(output)
+  }
+```
+
+This function is then run using the `ddply()` function from the `plyr` package.
+This takes the input data `pkdata` and splits it into separate datasets based
+on what columns are specified `.(STUDYID, SUBJID)` before running the desired
+function on each dataset `ebe_fn`.
+
+```{r ebe7}
+# Estimate empirical bayes estimates for each subject
+  ebedata <- as.data.table(ddply(pkdata, .(STUDYID, SUBJID), ebe_fn))
+```
+
+The resulting output will have the EBEs and the simulated predictions that 
+correspond with those estimates. Estimates can be evaluated by comparing the
+distribution of estimated parameters against model distributions, calculating
+shrinkage and using general model diagnostic plots.
+
+### Evaluation
+
+There are a variety of ways to evaluate both empirical Bayes estimates and
+the population pharmacokinetic model itself. When looking at EBEs it is 
+important that the distribution of the parameter values is similar to those
+that would be provided by the original model. This can be tested by overlaying
+the distribution of EBE values with a large number of randomly sampled parameter
+values from the model distribution.
+
+This can help determine if EBEs from a particular cohort are distributed 
+differently to other cohorts, among many other useful uses.
+
+```{r eval1}
+  ebedata[!duplicated(SUBJID), summary(CL)]
+  ebedata[!duplicated(SUBJID), plot(density(log(CL)))]
+  
+# Overlay estimated clearance values over distriution
+  nid <- ebedata[, length(unique(SUBJID))]
+  ind_wt <- ebedata[!duplicated(SUBJID), WT]
+  cl_sim <- 1.3 * (rep(ind_wt, each = 1000)/70)^0.319 * exp(rnorm(1000*nid, 0, 0.319))
+  plot(density(log(cl_sim)))
+  
+  p <- NULL
+  p <- ggplot() + theme_bw()
+  p <- p + geom_boxplot(aes(x = "SIM", y = cl_sim), outlier.shape = NA)
+  p <- p + geom_boxplot(aes(x = "EBE", 
+    y = ebedata[!duplicated(SUBJID), CL]), outlier.shape = NA)
+  p <- p + geom_dotplot(aes(x = "EBE", 
+    y = ebedata[!duplicated(SUBJID), CL]),
+    stackdir = "center", binaxis = "y", binwidth = 0.1, alpha = 0.1)
+  p <- p + labs(x = NULL, y = "Estimated Clearance (L/h)")
+  p_boxdot <- p + coord_cartesian(xlim = NULL, ylim = c(0.3, 4.4))
+  p_boxdot
+  
+  p <- NULL
+  p <- ggplot() + theme_bw()
+  p <- p + geom_density(aes(x = cl_sim), size = 1, colour = "blue")
+  p <- p + geom_vline(xintercept = median(cl_sim), alpha = 0.5, size = 1, colour = "blue")
+  p <- p + geom_vline(xintercept = quantile(cl_sim, probs = c(0.05, 0.95)), 
+    alpha = 0.5, size = 1, linetype = "dashed", colour = "blue")
+  p <- p + geom_density(aes(x = ebedata[!duplicated(SUBJID), CL]),
+    colour = "red", alpha = 0.6, size = 1)
+  p <- p + geom_vline(xintercept = rep(median(ebedata[!duplicated(SUBJID), CL]), 2),
+    alpha = 0.5, size = 1, colour = "red")
+  p <- p + geom_vline(xintercept = quantile(ebedata[!duplicated(SUBJID), CL], probs = c(0.05, 0.95)),
+    alpha = 0.5, size = 1, linetype = "dashed", colour = "red")
+  p <- p + labs(x = "Clearance (L/h)", y = "Density")
+  p_dens <- p + coord_cartesian(xlim = NULL, ylim = c(0.055, 1.15))
+  p_dens
+```
+
+With this plot, the solid lines should overlap, with the vertical lines ideally
+being as close as possible. The solid curved lines represent the distribution,
+while the vertical lines represent the median (solid) and 90% confidence
+intervals (dashed). The model distribution is in blue, while the EBE 
+distribution is in red. 
+
+```{r eval2}
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# ETA Shrinkage
+# Shrinkage implies bias, ideally it is below 20-30%. Negative shrinkage is
+#   possible, which describes EBEs with *very* low shrinkage.
+# High ETA shrinkage implies that predictions are biased to shrink towards the
+#   mean value. High ETA shrinkage will result in EBEs that are not indicative
+#   of the individual, but instead the population.
+# ETA shrinkage: 1 - SD(ETA)/PPV
+  list(
+    CL_ETA_shrinkage = 1 - sd(ebedata[!duplicated(SUBJID), ETA1])/0.319,
+    Vd_ETA_shrinkage = 1 - sd(ebedata[!duplicated(SUBJID), ETA2])/0.657,
+    ka_ETA_shrinkage = 1 - sd(ebedata[!duplicated(SUBJID), ETA3])/1.01
+  )
+```
+
+Finally, pharmacokinetic model evaluation can be used as well. If EBEs are of
+a high quality, then individual predictions should also be.
+
+```{r eval3}
+# - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
+# Individual vs Observed - External Model Validation
+  pdata <- ebedata[MDV == 0, ]
+  myPalette <- c("red", "blue", "darkgreen")
+  
+  p <- NULL
+  p <- ggplot(aes(x = PRED, y = DV), data = pdata)
+  p <- p + theme_bw()
+  p <- p + geom_point(aes(colour = STUDYID), size = 1.5, shape = 1, alpha = 0.5)
+  p <- p + geom_abline(intercept = 0, slope = 1, linetype = "dashed")
+  p <- p + stat_smooth(colour = "red", size = 1, method = "loess")
+  p <- p + scale_colour_manual("Study", values = myPalette)
+  p <- p + labs(x = "Predicted (mg/L)", y = "Observed (mg/L)")
+  p_DVvPRED <- p
+  p_DVvPRED
+  
+  p <- NULL
+  p <- ggplot(aes(x = IPRED, y = DV), data = pdata)
+  p <- p + theme_bw()
+  p <- p + geom_point(aes(colour = STUDYID), size = 1.5, shape = 1, alpha = 0.5)
+  p <- p + geom_abline(intercept = 0, slope = 1, linetype = "dashed")
+  p <- p + stat_smooth(colour = "red", size = 1, method = "loess")
+  p <- p + scale_colour_manual("Study", values = myPalette)
+  p <- p + labs(x = "Individual Predicted (mg/L)", y = "Observed (mg/L)")
+  p_DVvIPRE <- p
+  p_DVvIPRE
+  
+  p <- NULL
+  p <- ggplot(aes(x = TIME/24, y = WRES), data = pdata)
+  p <- p + theme_bw()
+  p <- p + geom_point(aes(colour = STUDYID), size = 1.5, shape = 1, alpha = 0.5)
+  p <- p + geom_hline(yintercept = 0, linetype = "dashed")
+  p <- p + stat_smooth(colour = "red", size = 1, method = "loess")
+  p <- p + scale_colour_manual("Study", values = myPalette)
+  p <- p + labs(x = "Weighted Residual", y = "Time (days)")
+  p <- p + coord_cartesian(xlim = NULL, ylim = c(-12.5, 12.5))
+  p_TIMEvWRES <- p
+  p_TIMEvWRES
+  
+  p <- NULL
+  p <- ggplot(aes(x = PRED, y = WRES), data = pdata)
+  p <- p + theme_bw()
+  p <- p + geom_point(aes(colour = STUDYID), size = 1.5, shape = 1, alpha = 0.5)
+  p <- p + geom_hline(yintercept = 0, linetype = "dashed")
+  p <- p + stat_smooth(colour = "red", size = 1, method = "loess")
+  p <- p + scale_colour_manual("Study", values = myPalette)
+  p <- p + labs(x = "Predicted (mg/L)", y = "Weighted Residual")
+  p <- p + coord_cartesian(xlim = c(0, 100), ylim = c(-12.5, 12.5))
+  p_PREDvWRES <- p
+  p_PREDvWRES
+```

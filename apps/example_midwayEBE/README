@@ -1,0 +1,17 @@
+Once the UI functionality is set up, data must be prepared for empirical 
+Bayesian estimation. This is the rate-limiting step of the final application.
+Therefore, care needs to be taken so that the time for this step to run is kept
+to a minimum.
+
+First the data that is provided by the covariate ("input$covX", "input$covY", 
+etc.), dose ("r$dose_df") and concentration input ("r$conc_df") should be 
+combined and prepared into the format required for empirical Bayesian 
+estimation. In this example `mrgsolve` is used.
+
+Once this is done, the data is sent to the empirical Bayesian estimation
+function, that aims to provide an output which can be used for Bayesian 
+forecasting. This uses a process similar to simulation studies using this
+method for dose optimisation, except that it is only done for a single patient.
+
+If this works without errors, then the application can be finalised, using the
+EBEs to drive the Bayesian Forecasting tab of the app.

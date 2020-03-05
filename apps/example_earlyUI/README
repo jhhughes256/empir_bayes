@@ -1,0 +1,19 @@
+The first step is set up the UI. This includes any covariate information you
+wish for the user to input, and the way you plan for the user to input dosing
+and plasma sample data.
+
+In this case "input.ui" functions are used. These require the app developer
+to consider how many inputs are desired for each row, and adjust the functions
+in global.R accordingly. Also consider what type of input these should be
+(i.e. numericInput, textInput), so that they match with the reactiveValues
+data.frames in server.R.
+
+It is desired for users to be able to add and remove rows form these input
+boxes, ensuring this base code is working with the desired layout of input
+types is important before adding additional complexity.
+
+Changes made to "input.ui" functions, require corresponding changes to the
+"input.update" functions so that the add, remove and save buttons work.
+
+The second tab has a plan for the general layout, but the actual output is not
+important at this stage.
